@@ -1,0 +1,160 @@
+import pytest
+
+from haystack import Document, DeserializationError, Pipeline
+from haystack.components.retrievers import InMemoryBM25Retriever
+from haystack.components.retrievers.sentence_window_retriever import SentenceWindowRetriever
+from haystack.document_stores.in_memory import InMemoryDocumentStore
+from haystack.components.preprocessors import DocumentSplitter
+
+
+class TestSentenceWindowRetriever:
+    def test_init_default(self):
+        retriever = SentenceWindowRetriever(InMemoryDocumentStore())
+        assert retriever.window_size == 3
+
+    def test_init_with_parameters(self):
+        retriever = SentenceWindowRetriever(InMemoryDocumentStore(), window_size=5)
+        assert retriever.window_size == 5
+
+    def test_init_with_invalid_window_size_parameter(self):
+        with pytest.raises(ValueError):
+            SentenceWindowRetriever(InMemoryDocumentStore(), window_size=-2)
+
+    def test_merge_documents(self):
+        docs = [
+            {
+                "id": "doc_0",
+                "content": "This is a text with some words. There is a ",
+                "source_id": "c5d7c632affc486d0cfe7b3c0f4dc1d3896ea720da2b538d6d10b104a3df5f99",
+                "page_number": 1,
+                "split_id": 0,
+                "split_idx_start": 0,
+                "_split_overlap": [{"doc_id": "doc_1", "range": (0, 23)}],
+            },
+            {
+                "id": "doc_1",
+                "content": "some words. There is a second sentence. And there is ",
+                "source_id": "c5d7c632affc486d0cfe7b3c0f4dc1d3896ea720da2b538d6d10b104a3df5f99",
+                "page_number": 1,
+                "split_id": 1,
+                "split_idx_start": 20,
+                "_split_overlap": [{"doc_id": "doc_0", "range": (20, 43)}, {"doc_id": "doc_2", "range": (0, 29)}],
+            },
+            {
+                "id": "doc_2",
+                "content": "second sentence. And there is also a third sentence",
+                "source_id": "c5d7c632affc486d0cfe7b3c0f4dc1d3896ea720da2b538d6d10b104a3df5f99",
+                "page_number": 1,
+                "split_id": 2,
+                "split_idx_start": 43,
+                "_split_overlap": [{"doc_id": "doc_1", "range": (23, 52)}],
+            },
+        ]
+        merged_text = SentenceWindowRetriever.merge_documents_text([Document.from_dict(doc) for doc in docs])
+        expected = "This is a text with some words. There is a second sentence. And there is also a third sentence"
+        assert merged_text == expected
+
+    def test_to_dict(self):
+        window_retriever = SentenceWindowRetriever(InMemoryDocumentStore())
+        data = window_retriever.to_dict()
+
+        assert data["type"] == "haystack.components.retrievers.sentence_window_retriever.SentenceWindowRetriever"
+        assert data["init_parameters"]["window_size"] == 3
+        assert (
+            data["init_parameters"]["document_store"]["type"]
+            == "haystack.document_stores.in_memory.document_store.InMemoryDocumentStore"
+        )
+
+    def test_from_dict(self):
+        data = {
+            "type": "haystack.components.retrievers.sentence_window_retriever.SentenceWindowRetriever",
+            "init_parameters": {
+                "document_store": {
+                    "type": "haystack.document_stores.in_memory.document_store.InMemoryDocumentStore",
+                    "init_parameters": {},
+                },
+                "window_size": 5,
+            },
+        }
+        component = SentenceWindowRetriever.from_dict(data)
+        assert isinstance(component.document_store, InMemoryDocumentStore)
+        assert component.window_size == 5
+
+    def test_from_dict_without_docstore(self):
+        data = {"type": "SentenceWindowRetriever", "init_parameters": {}}
+        with pytest.raises(DeserializationError, match="Missing 'document_store' in serialization data"):
+            SentenceWindowRetriever.from_dict(data)
+
+    def test_from_dict_without_docstore_type(self):
+        data = {"type": "SentenceWindowRetriever", "init_parameters": {"document_store": {"init_parameters": {}}}}
+        with pytest.raises(DeserializationError):
+            SentenceWindowRetriever.from_dict(data)
+
+    def test_from_dict_non_existing_docstore(self):
+        data = {
+            "type": "SentenceWindowRetriever",
+            "init_parameters": {"document_store": {"type": "Nonexisting.Docstore", "init_parameters": {}}},
+        }
+        with pytest.raises(DeserializationError):
+            SentenceWindowRetriever.from_dict(data)
+
+    def test_document_without_split_id(self):
+        docs = [
+            Document(content="This is a text with some words. There is a ", meta={"id": "doc_0"}),
+            Document(content="some words. There is a second sentence. And there is ", meta={"id": "doc_1"}),
+        ]
+        with pytest.raises(ValueError):
+            retriever = SentenceWindowRetriever(document_store=InMemoryDocumentStore(), window_size=3)
+            retriever.run(retrieved_documents=docs)
+
+    def test_document_without_source_id(self):
+        docs = [
+            Document(content="This is a text with some words. There is a ", meta={"id": "doc_0", "split_id": 0}),
+            Document(
+                content="some words. There is a second sentence. And there is ", meta={"id": "doc_1", "split_id": 1}
+            ),
+        ]
+        with pytest.raises(ValueError):
+            retriever = SentenceWindowRetriever(document_store=InMemoryDocumentStore(), window_size=3)
+            retriever.run(retrieved_documents=docs)
+
+    @pytest.mark.integration
+    def test_run_with_pipeline(self):
+        splitter = DocumentSplitter(split_length=10, split_overlap=5, split_by="word")
+        text = (
+            "This is a text with some words. There is a second sentence. And there is also a third sentence. "
+            "It also contains a fourth sentence. And a fifth sentence. And a sixth sentence. And a seventh sentence"
+        )
+        doc = Document(content=text)
+        docs = splitter.run([doc])
+        doc_store = InMemoryDocumentStore()
+        doc_store.write_documents(docs["documents"])
+
+        pipe = Pipeline()
+        pipe.add_component("bm25_retriever", InMemoryBM25Retriever(doc_store, top_k=1))
+        pipe.add_component(
+            "sentence_window_retriever", SentenceWindowRetriever(document_store=doc_store, window_size=2)
+        )
+        pipe.connect("bm25_retriever", "sentence_window_retriever")
+        result = pipe.run({"bm25_retriever": {"query": "third"}})
+
+        assert result["sentence_window_retriever"]["context_windows"] == [
+            "some words. There is a second sentence. And there is also a third sentence. It also "
+            "contains a fourth sentence. And a fifth sentence. And a sixth sentence. And a "
+        ]
+        assert len(result["sentence_window_retriever"]["context_documents"][0]) == 5
+
+    @pytest.mark.integration
+    def test_serialization_deserialization_in_pipeline(self):
+        doc_store = InMemoryDocumentStore()
+        pipe = Pipeline()
+        pipe.add_component("bm25_retriever", InMemoryBM25Retriever(doc_store, top_k=1))
+        pipe.add_component(
+            "sentence_window_retriever", SentenceWindowRetriever(document_store=doc_store, window_size=2)
+        )
+        pipe.connect("bm25_retriever", "sentence_window_retriever")
+
+        serialized = pipe.to_dict()
+        deserialized = Pipeline.from_dict(serialized)
+
+        assert deserialized == pipe
